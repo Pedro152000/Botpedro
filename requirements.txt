@@ -1,2 +1,4 @@
 requests
 pyTelegramBotAPI
+beautifulsoup4
+lxml
