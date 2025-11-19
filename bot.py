@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-# bot.py - FlashScore (versão estável) -> envia sinais PREMIUM para Telegram
+# bot.py - FlashScore (estável) com contador de GREEN/RED
+# Regras:
+# - Envia sinal (GOL / ESCANTEIO) usando heurísticas
+# - Registra sinal pendente em pending_signals.json
+# - Marca GREEN se o evento ocorrer após o sinal
+# - Marca RED no HT (intervalo) ou FT (final) se evento não ocorreu
+# - Persistência em stats.json (greens / reds) e pending_signals.json
+
 import time
 import requests
 from bs4 import BeautifulSoup
 import telebot
 import logging
 import re
+import json
+import os
+from datetime import datetime
 
 # ----------------------------
 # CONFIGURAÇÃO (já com seus dados)
@@ -20,6 +30,10 @@ POLL_INTERVAL = 25
 FS_HOME = "https://www.flashscore.com/football/"
 FS_BASE = "https://www.flashscore.com"
 
+# Filenames for persistence
+STATS_FILE = "stats.json"
+PENDING_FILE = "pending_signals.json"
+
 # Inicializa bot Telegram
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -33,12 +47,37 @@ HEADERS = {
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-# Evita duplicar sinais (memória simples)
-sent_signals = set()
-last_scores = {}  # partida_id -> "1-0"
+# In-memory caches
+sent_signals = set()     # evita duplicações imediatas
+last_scores = {}         # key -> score string
+# pending_signals: dict key -> { type, match_key, sign_time, sign_score, sign_corners, raw, resolved: None/ 'GREEN'/'RED' }
+pending_signals = {}
 
 # ----------------------------
-# UTILITÁRIOS DE EXTRAÇÃO
+# Persistence helpers
+# ----------------------------
+def load_json_file(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logging.warning("Erro carregando %s: %s", path, e)
+    return default
+
+def save_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error("Erro salvando %s: %s", path, e)
+
+# stats: {'greens': int, 'reds': int}
+stats = load_json_file(STATS_FILE, {"greens": 0, "reds": 0})
+pending_signals = load_json_file(PENDING_FILE, {})
+
+# ----------------------------
+# UTILITÁRIOS
 # ----------------------------
 def fetch_html(url, timeout=12):
     try:
@@ -72,72 +111,59 @@ def find_live_matches_from_home(html):
     return unique
 
 def parse_match_summary_from_raw(raw):
-    """
-    Tenta extrair times, minuto e placar de um texto bruto.
-    Isso é heurístico — serve como fallback.
-    """
-    # Exemplo de raw: "Chelsea 1 - 0 Arsenal 67'"
-    # Remove múltiplos espaços
+    """Extrai minuto e placar de um texto bruto (heurístico)."""
     text = re.sub(r'\s+', ' ', raw).strip()
-    # tenta localizar minuto (número seguido de ')
     minute = None
+    status = None
     mm = re.search(r"(\d{1,3})'", text)
     if mm:
         minute = mm.group(1)
-    # tenta extrair placar X-Y
+    # detect HT/FT keywords
+    if re.search(r'\b(ht|half-time|intervalo)\b', text, re.I):
+        status = "HT"
+    if re.search(r'\b(ft|full-time|final)\b', text, re.I):
+        status = "FT"
+    # score
     score = None
     sc = re.search(r"(\d+)\s*[-–]\s*(\d+)", text)
     if sc:
         score = f"{sc.group(1)}-{sc.group(2)}"
-    # times: pegar primeira parte antes do placar e depois
-    home = "Unknown"
-    away = "Unknown"
+    # try to get teams around the score
+    home = "Home"
+    away = "Away"
     if score:
         parts = text.split(score)
         if len(parts) >= 2:
             left = parts[0].strip()
             right = parts[1].strip()
-            # left tem home possivelmente com nome
-            left_names = left.split()
-            right_names = right.split()
-            # heurística simples
-            home = " ".join(left_names[:-0]) if left else left
-            # away = first few words of right until minute or end
+            home = left
             away = right.split()[0] if right else "Away"
-    return {"minute": minute or "N/A", "score": score or "0-0", "home": home, "away": away}
+    return {"minute": minute or "N/A", "score": score or "0-0", "home": home, "away": away, "status": status or ""}
 
 def fetch_match_stats(match_href):
-    """
-    Tenta abrir a página do jogo e extrair estatísticas (corners, attacks, shots).
-    Retorna dicionário com chaves: 'corners', 'attacks', 'shots' (inteiros ou None).
-    """
+    """Tenta extrair estatísticas da página do jogo (corners, attacks, shots)."""
     url = FS_BASE + match_href
     html = fetch_html(url)
     if not html:
         return None
     soup = BeautifulSoup(html, "lxml")
-
     stats = {"corners": None, "attacks": None, "shots": None}
-
-    # Flashscore tem blocos com classe "statValue" / labels; vamos procurar por palavras-chave
     try:
-        # procura por blocos de estatística textual
         text = soup.get_text(" ", strip=True).lower()
         # corners
-        m = re.search(r'escanteios\s*(\d+)\s*-\s*(\d+)', text)
+        m = re.search(r'escanteios\s*(\d+)\s*[-–]\s*(\d+)', text)
         if m:
             stats["corners"] = int(m.group(1)) + int(m.group(2))
         else:
-            # english
-            m = re.search(r'corners\s*(\d+)\s*-\s*(\d+)', text)
+            m = re.search(r'corners\s*(\d+)\s*[-–]\s*(\d+)', text)
             if m:
                 stats["corners"] = int(m.group(1)) + int(m.group(2))
-        # shots on target or shots
-        m2 = re.search(r'(shots on target|shots)\s*(\d+)\s*-\s*(\d+)', text)
+        # shots
+        m2 = re.search(r'(shots on target|shots)\s*(\d+)\s*[-–]\s*(\d+)', text)
         if m2:
             stats["shots"] = int(m2.group(2)) + int(m2.group(3))
-        # attacks / dangerous attacks
-        m3 = re.search(r'(attacks|dangerous attacks|ataques perigosos)\s*(\d+)\s*-\s*(\d+)', text)
+        # attacks
+        m3 = re.search(r'(attacks|dangerous attacks|ataques perigosos)\s*(\d+)\s*[-–]\s*(\d+)', text)
         if m3:
             stats["attacks"] = int(m3.group(2)) + int(m3.group(3))
     except Exception as e:
@@ -145,7 +171,50 @@ def fetch_match_stats(match_href):
     return stats
 
 # ----------------------------
-# LÓGICA DE SINAIS (PREMIUM FORMAT)
+# PERSISTÊNCIA DE SINAL (CRIAR / RESOLVER)
+# ----------------------------
+def add_pending_signal(key, kind, match_key, sign_score, sign_corners, raw):
+    sign = {
+        "kind": kind,                 # "GOL" ou "ESCANTEIO"
+        "match_key": match_key,       # link ou raw identifier
+        "sign_time": datetime.utcnow().isoformat(),
+        "sign_score": sign_score,     # "1-0"
+        "sign_corners": sign_corners, # int or None
+        "raw": raw,
+        "resolved": None,             # "GREEN" ou "RED"
+        "resolved_time": None
+    }
+    pending_signals[key] = sign
+    save_json_file(PENDING_FILE, pending_signals)
+
+def resolve_pending_signal(key, result):
+    """result: 'GREEN' or 'RED'"""
+    entry = pending_signals.get(key)
+    if not entry:
+        return
+    entry["resolved"] = result
+    entry["resolved_time"] = datetime.utcnow().isoformat()
+    # atualizar stats
+    if result == "GREEN":
+        stats["greens"] = stats.get("greens", 0) + 1
+    elif result == "RED":
+        stats["reds"] = stats.get("reds", 0) + 1
+    # persist
+    save_json_file(STATS_FILE, stats)
+    save_json_file(PENDING_FILE, pending_signals)
+
+    # enviar notificação para o Telegram
+    try:
+        if result == "GREEN":
+            msg = f"🟩 GREEN CONFIRMADO!\n\nSinal: {entry['kind']}\nJogo: {entry['raw']}\n\nTotal:\n🟩 Greens: {stats['greens']}\n🟥 Reds: {stats['reds']}"
+        else:
+            msg = f"🟥 RED REGISTRADO\n\nSinal: {entry['kind']}\nJogo: {entry['raw']}\n\nTotal:\n🟩 Greens: {stats['greens']}\n🟥 Reds: {stats['reds']}"
+        bot.send_message(CHAT_ID, msg)
+    except Exception as e:
+        logging.warning("Erro enviando confirmação %s: %s", result, e)
+
+# ----------------------------
+# Construção de mensagem PREMIUM
 # ----------------------------
 def build_premium_message(match_info, analysis, tipo):
     home = match_info.get("home", "Home")
@@ -182,110 +251,139 @@ def build_premium_message(match_info, analysis, tipo):
         )
     return text
 
+# ----------------------------
+# Análise e envio de sinal
+# ----------------------------
 def analyze_and_send(match):
-    """
-    match: dict with keys 'link' and 'raw' at least.
-    """
-    # basic parse from raw for fallback
     parsed = parse_match_summary_from_raw(match.get("raw",""))
     match_href = match.get("link")
+    match_key = match_href or match.get("raw")
     match_info = {"home": parsed.get("home"), "away": parsed.get("away"),
                   "minute": parsed.get("minute"), "score": parsed.get("score"),
                   "league": "Desconhecida"}
 
-    # try to fetch match detail for better stats
-    stats = fetch_match_stats(match_href) if match_href else None
+    stats_local = fetch_match_stats(match_href) if match_href else None
 
-    # build analysis heuristics
     analysis = {"corners": None, "attacks": None, "shots": None, "prob": None, "intensity": None, "favor_home": True}
-
-    if stats:
-        analysis["corners"] = stats.get("corners")
-        analysis["attacks"] = stats.get("attacks")
-        analysis["shots"] = stats.get("shots")
-        # simple heuristics for intensity and probability
+    if stats_local:
+        analysis["corners"] = stats_local.get("corners")
+        analysis["attacks"] = stats_local.get("attacks")
+        analysis["shots"] = stats_local.get("shots")
         intensity = 0
         if analysis["attacks"]:
             intensity += min(100, int(analysis["attacks"] / 2))
         if analysis["shots"]:
             intensity += min(100, int(analysis["shots"] * 3))
         analysis["intensity"] = min(100, intensity)
-        # favor home if more attacks on home side? fallback random-like
-        analysis["favor_home"] = True
-        # prob estimada
         analysis["prob"] = min(95, 40 + (analysis["intensity"] // 2))
     else:
-        # fallback heuristics from raw/score
-        score = parsed.get("score","0-0")
         try:
-            s1, s2 = map(int, score.split("-"))
+            s1, s2 = map(int, parsed.get("score","0-0").split("-"))
         except:
             s1, s2 = 0, 0
         total = s1 + s2
-        analysis["shots"] = None
-        analysis["attacks"] = None
-        analysis["corners"] = None
         analysis["intensity"] = 40 + min(40, total*10)
         analysis["prob"] = 60 + min(30, total*10)
-        analysis["favor_home"] = True
 
-    # Decide signals:
-    # GOL: if placar mudou since last_scores OR intensity high + minute in range
-    key_id = match.get("link", match.get("raw"))
-    current_score = parsed.get("score","0-0")
-    prev = last_scores.get(key_id)
-    last_scores[key_id] = current_score
+    # Heurísticas simples de sinal
+    minute_val = int(parsed.get("minute")) if str(parsed.get("minute")).isdigit() else 0
 
-    sent_any = False
+    # SINAL: GOL — se intensidade alta ou mudança de placar detectada (but avoid duplicates)
+    # We'll only proactively suggest gol if intensity high OR shots high OR score low and minute in proper range
+    try:
+        score_now = parsed.get("score","0-0")
+    except:
+        score_now = "0-0"
 
-    # detect goal by change
-    if prev and prev != current_score:
-        # got a score change -> send GOL
-        unique = f"{key_id}-GOL-{current_score}"
-        if unique not in sent_signals:
-            msg = build_premium_message(match_info, analysis, "GOL")
-            try:
-                bot.send_message(CHAT_ID, msg)
-                logging.info("Enviado sinal GOL: %s", key_id)
-            except Exception as e:
-                logging.error("Erro ao enviar GOL: %s", e)
-            sent_signals.add(unique)
-            sent_any = True
+    # Decide send conditions
+    send_gol = False
+    send_esc = False
+    # gol if intensity high and minute between 15-85 and not already sent for this score
+    if analysis.get("intensity",0) >= 80 and 15 <= minute_val <= 85:
+        send_gol = True
 
-    # detect escanteio by corners heuristic (if known)
+    # escanteio if corners known and rising or above threshold
     if analysis.get("corners") is not None:
-        # If many corners recently or rising, send escanteio signal
-        if analysis["corners"] >= 8 and analysis.get("intensity",0) >= 50:
-            unique = f"{key_id}-ESC-{analysis['corners']}"
-            if unique not in sent_signals:
-                msg = build_premium_message(match_info, analysis, "ESCANTEIO")
-                try:
-                    bot.send_message(CHAT_ID, msg)
-                    logging.info("Enviado sinal ESCANTEIO: %s", key_id)
-                except Exception as e:
-                    logging.error("Erro ao enviar ESC: %s", e)
-                sent_signals.add(unique)
-                sent_any = True
+        if analysis["corners"] >= 6 and minute_val >= 20:
+            send_esc = True
 
-    # heuristic: if intensity very high and minute between 15-85, maybe send Gol suggestion
-    if not sent_any and analysis.get("intensity",0) >= 85 and 15 <= int(match_info.get("minute") if str(match_info.get("minute")).isdigit() else 50) <= 85:
-        unique = f"{key_id}-INT-{analysis['intensity']}"
-        if unique not in sent_signals:
-            msg = build_premium_message(match_info, analysis, "GOL")
-            try:
-                bot.send_message(CHAT_ID, msg)
-                logging.info("Enviado sinal de INTENSIDADE: %s", key_id)
-            except Exception as e:
-                logging.error("Erro ao enviar INT: %s", e)
-            sent_signals.add(unique)
+    # avoid duplicate signals for same match & type within short time
+    key_g = f"{match_key}-GOL-{score_now}"
+    key_e = f"{match_key}-ESC-{analysis.get('corners')}"
+
+    # send gol
+    if send_gol and key_g not in sent_signals and key_g not in pending_signals:
+        msg = build_premium_message(match_info, analysis, "GOL")
+        try:
+            bot.send_message(CHAT_ID, msg)
+            logging.info("Sinal GOL enviado: %s", match_key)
+            sent_signals.add(key_g)
+            # store pending: we record sign_score (current score) and sign_corners if available
+            add_pending_signal(key_g, "GOL", match_key, score_now, analysis.get("corners"), match.get("raw"))
+        except Exception as e:
+            logging.error("Erro enviando GOL: %s", e)
+
+    # send esc
+    if send_esc and key_e not in sent_signals and key_e not in pending_signals:
+        msg = build_premium_message(match_info, analysis, "ESCANTEIO")
+        try:
+            bot.send_message(CHAT_ID, msg)
+            logging.info("Sinal ESC enviado: %s", match_key)
+            sent_signals.add(key_e)
+            add_pending_signal(key_e, "ESCANTEIO", match_key, score_now, analysis.get("corners"), match.get("raw"))
+        except Exception as e:
+            logging.error("Erro enviando ESC: %s", e)
 
 # ----------------------------
-# LOOP PRINCIPAL
+# Checar pendentes para marcar GREEN / RED
+# ----------------------------
+def check_pending_with_match(match):
+    """Dado um match (raw + link), verificar pendentes relacionados e resolver."""
+    parsed = parse_match_summary_from_raw(match.get("raw",""))
+    match_key = match.get("link") or match.get("raw")
+    current_score = parsed.get("score","0-0")
+    status = parsed.get("status","")  # may contain HT/FT
+
+    # fetch stats for corners if needed
+    stats_local = fetch_match_stats(match.get("link")) if match.get("link") else None
+    current_corners = stats_local.get("corners") if stats_local else None
+
+    to_resolve = []
+    for key, entry in list(pending_signals.items()):
+        if entry.get("resolved"):
+            continue
+        if entry.get("match_key") != match_key:
+            continue
+
+        # If kind == GOL -> green if score changed vs sign_score
+        if entry["kind"] == "GOL":
+            if current_score != entry.get("sign_score"):
+                # goal happened (score changed)
+                resolve_pending_signal(key, "GREEN")
+            else:
+                # if HT or FT arrived -> mark RED
+                if status and status.upper() in ("HT","FT"):
+                    resolve_pending_signal(key, "RED")
+        elif entry["kind"] == "ESCANTEIO":
+            # If we have corners stats and corners increased past sign_corners -> green
+            if current_corners is not None and entry.get("sign_corners") is not None:
+                if current_corners > (entry.get("sign_corners") or 0):
+                    resolve_pending_signal(key, "GREEN")
+                else:
+                    if status and status.upper() in ("HT","FT"):
+                        resolve_pending_signal(key, "RED")
+            else:
+                # if no corners info available, fallback: if HT/FT -> RED (no confirmation)
+                if status and status.upper() in ("HT","FT"):
+                    resolve_pending_signal(key, "RED")
+
+# ----------------------------
+# Loop principal
 # ----------------------------
 def run():
-    # notify start (try safe)
+    # notify start
     try:
-        bot.send_message(CHAT_ID, "🤖 Bot FlashScore (estável) iniciado — monitorando partidas...")
+        bot.send_message(CHAT_ID, "🤖 Bot FlashScore (estável) iniciado — monitorando partidas... (GREEN/RED ativo)")
     except Exception:
         logging.info("Não foi possível enviar mensagem de início — verifique permissões do bot.")
 
@@ -300,15 +398,23 @@ def run():
             candidates = find_live_matches_from_home(html)
             logging.info("Encontrados %d candidatos na página principal.", len(candidates))
 
-            # Para cada candidato, analisar e possivelmente enviar sinal
+            # Primeiro: para todos os candidatos checar pendentes
             for c in candidates:
-                # filtrar entradas muito curtas
-                if len(c.get("raw","")) < 10:
-                    continue
+                try:
+                    check_pending_with_match(c)
+                except Exception as e:
+                    logging.exception("Erro resolvendo pendentes para partida: %s", e)
+
+            # Depois: analisar e possivelmente enviar novos sinais
+            for c in candidates:
                 try:
                     analyze_and_send(c)
                 except Exception as e:
                     logging.exception("Erro analisando partida: %s", e)
+
+            # persist pending and stats periodically
+            save_json_file(PENDING_FILE, pending_signals)
+            save_json_file(STATS_FILE, stats)
 
             time.sleep(POLL_INTERVAL)
 
@@ -318,6 +424,22 @@ def run():
         except Exception as e:
             logging.exception("Erro no loop principal: %s", e)
             time.sleep(POLL_INTERVAL)
+
+# ----------------------------
+# Comando simples /stats via Telegram (opcional)
+# ----------------------------
+@bot.message_handler(commands=['stats'])
+def handle_stats(message):
+    try:
+        g = stats.get("greens",0)
+        r = stats.get("reds",0)
+        total = g + r
+        acc = f"{(g/total*100):.1f}%" if total>0 else "N/A"
+        txt = f"📊 Estatísticas do Bot Pedro\n\n🟩 Greens: {g}\n🟥 Reds: {r}\nTaxa de acerto: {acc}"
+        bot.reply_to(message, txt)
+    except Exception as e:
+        logging.error("Erro /stats: %s", e)
+        bot.reply_to(message, "Erro ao obter estatísticas.")
 
 if __name__ == "__main__":
     run()
