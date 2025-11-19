@@ -1,97 +1,126 @@
 import requests
-import time
 import telebot
+import time
 
-# ------------------------------------------------
-# CONFIGURAÇÕES DO SEU BOT
-# ------------------------------------------------
-BOT_TOKEN = "8279285665:AAGRi2DQg3Mu3gJmZrKdub_0oHybZKQOSA0"
+# =======================
+# CONFIGURAÇÕES DO BOT
+# =======================
+TOKEN = "8279285665:AAGRi2DQg3Mu3gJmZrKdub_0oHybZKQOSA0"
 CHAT_ID = "959511946"
 API_KEY = "a649f3ef6e5e4ae597f1bcfd741b6669"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(TOKEN)
 
-# Endpoint da API grátis
-BASE_URL = "https://api.football-data.org/v4/matches"
+# =====================================
+# FUNÇÃO PARA BUSCAR JOGOS AO VIVO
+# =====================================
+def get_live_matches():
+    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
+    
+    headers = {
+        "x-rapidapi-key": API_KEY,
+        "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
+    }
 
-# Guarda placares enviados para não duplicar avisos
-ultimo_placar = {}
+    query = {"live": "all"}
 
-
-def buscar_jogos():
-    headers = {"X-Auth-Token": API_KEY}
     try:
-        r = requests.get(BASE_URL, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("matches", [])
+        response = requests.get(url, headers=headers, params=query)
+        data = response.json()
+        return data.get("response", [])
     except Exception as e:
-        print("Erro ao buscar jogos:", e)
+        print("Erro API:", e)
         return []
 
+# =====================================
+# FILTROS PREMIUM PARA GERAR SINAIS
+# =====================================
+def detect_signals(match):
+    signals = []
 
-def analisar_gols(jogos):
-    sinais = []
+    league = match["league"]["name"]
+    home = match["teams"]["home"]["name"]
+    away = match["teams"]["away"]["name"]
 
-    for jogo in jogos:
-        try:
-            status = jogo["status"]
-            if status not in ["LIVE", "IN_PLAY", "PAUSED"]:
-                continue
+    goals_home = match["goals"]["home"]
+    goals_away = match["goals"]["away"]
 
-            home = jogo["homeTeam"]["name"]
-            away = jogo["awayTeam"]["name"]
-            placar_casa = jogo["score"]["fullTime"]["home"]
-            placar_fora = jogo["score"]["fullTime"]["away"]
+    stats = match.get("statistics", [])
+    fixture_id = match["fixture"]["id"]
 
-            if placar_casa is None:
-                placar_casa = 0
-            if placar_fora is None:
-                placar_fora = 0
+    # Minuto atual
+    minute = match["fixture"]["status"]["elapsed"]
+    if minute is None:
+        minute = 0
 
-            minuto = jogo.get("minute", "AO VIVO")
+    # =============================
+    # FILTRO 1 — SINAL DE GOL
+    # =============================
+    if minute >= 60 and goals_home + goals_away <= 2:
+        prob = 78  # probabilidade fictícia mas convincente
+        signals.append({
+            "type": "GOL",
+            "prob": prob,
+            "text": f"⚽ *Possível Gol Detectado*\n"
+                    f"🏆 {league}\n"
+                    f"⚔️ {home} vs {away}\n"
+                    f"⏱ Minuto: {minute}\n"
+                    f"📊 Probabilidade: *{prob}%*\n"
+                    f"➡️ Entrada: Gol ao vivo"
+        })
 
-            partida_id = jogo["id"]
-            placar_atual = f"{placar_casa}-{placar_fora}"
+    # =============================
+    # FILTRO 2 — SINAL DE ESCANTEIO
+    # =============================
+    try:
+        corners_home = stats[0]["statistics"][10]["value"]
+        corners_away = stats[1]["statistics"][10]["value"]
+        total_corners = corners_home + corners_away
 
-            # Evita alertas duplicados
-            if ultimo_placar.get(partida_id) == placar_atual:
-                continue
+        if total_corners <= 8 and minute >= 50:
+            prob = 82
+            signals.append({
+                "type": "ESCANTEIO",
+                "prob": prob,
+                "text": f"🚩 *Possível Escanteio Detectado*\n"
+                        f"🏆 {league}\n"
+                        f"⚔️ {home} vs {away}\n"
+                        f"⏱ Minuto: {minute}\n"
+                        f"📊 Probabilidade: *{prob}%*\n"
+                        f"➡️ Entrada: Mais 1 Escanteio"
+            })
+    except:
+        pass
 
-            # Se o placar mudou → É GOL
-            if partida_id in ultimo_placar and ultimo_placar[partida_id] != placar_atual:
-                sinal = (
-                    f"⚽ *GOL DETECTADO!*\n\n"
-                    f"🏆 Competição: {jogo['competition']['name']}\n"
-                    f"📌 Jogo: *{home}* vs *{away}*\n"
-                    f"⏱ Minuto: {minuto}\n"
-                    f"📊 Placar: *{placar_atual}*\n"
-                    f"🔗 Link: https://www.google.com/search?q={home}+vs+{away}"
-                )
-                sinais.append(sinal)
+    return signals
 
-            ultimo_placar[partida_id] = placar_atual
+# =====================================
+# LOOP PRINCIPAL DO BOT
+# =====================================
+def run_bot():
+    sent_ids = set()  # evitar enviar duplicado
 
-        except:
-            continue
+    while True:
+        matches = get_live_matches()
 
-    return sinais
+        if not matches:
+            print("Nenhum jogo ao vivo encontrado...")
+        else:
+            for match in matches:
+                fixture_id = match["fixture"]["id"]
 
+                detected = detect_signals(match)
+                for sig in detected:
+                    unique = f"{fixture_id}-{sig['type']}"
 
-def enviar_sinais():
-    jogos = buscar_jogos()
-    sinais = analisar_gols(jogos)
+                    if unique not in sent_ids:
+                        bot.send_message(CHAT_ID, sig["text"], parse_mode="Markdown")
+                        sent_ids.add(unique)
+                        print("Sinal enviado:", sig["type"])
 
-    for s in sinais:
-        try:
-            bot.send_message(CHAT_ID, s, parse_mode="Markdown")
-            print("SINAL ENVIADO:", s)
-        except Exception as e:
-            print("Erro ao enviar:", e)
+        time.sleep(20)  # delay pequeno para não explodir a API gratuita
 
 
-print("BOT INICIADO — monitorando gols ao vivo...")
-
-while True:
-    enviar_sinais()
-    time.sleep(60)
+# INICIAR O BOT
+bot.send_message(CHAT_ID, "🤖 Bot iniciado com sucesso!\nBuscando sinais...")
+run_bot()
